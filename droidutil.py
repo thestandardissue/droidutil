@@ -538,8 +538,18 @@ class Adb:
         }
 
     def uninstall(self, pkg):
+        """Remove pkg for the main user. Returns the action that took effect:
+        "uninstall", "disable" (fallback for blocked system apps), or None on failure."""
         _check(PKG_RE.match(pkg) and not is_protected(pkg))
-        return "Success" in self.shell(f"pm uninstall -k --user 0 {pkg}", change=True)[1]
+        out = self.shell(f"pm uninstall -k --user 0 {pkg}", change=True)[1]
+        if "Success" in out:
+            return "uninstall"
+        # Newer Android (seen on Android 17) refuses per-user uninstall of built-in
+        # system apps from ADB without root. Disabling still works and is reversible.
+        if "only root can delete system app" in out:
+            self.log(f"  Android blocks uninstalling built-in system apps without root - disabling {pkg} instead.")
+            return "disable" if self.disable(pkg) else None
+        return None
 
     def disable(self, pkg):
         _check(PKG_RE.match(pkg) and not is_protected(pkg))
@@ -1092,19 +1102,30 @@ class App:
             return
 
         def job():
-            ok = fail = 0
+            removed = disabled = fail = 0
             for pkg in sel:
                 if is_protected(pkg):
                     self.log(f"Skipped protected package {pkg}")
                     continue
-                good = self.adb.uninstall(pkg) if method == "uninstall" else self.adb.disable(pkg)
-                if good:
-                    ok += 1
-                    if not self.adb.dry_run:
-                        self.backup.add(method, pkg)
+                if method == "uninstall":
+                    action = self.adb.uninstall(pkg)
+                else:
+                    action = "disable" if self.adb.disable(pkg) else None
+                if action == "uninstall":
+                    removed += 1
+                elif action == "disable":
+                    disabled += 1
                 else:
                     fail += 1
-            self.log(f"Done: {ok} {'removed' if method == 'uninstall' else 'disabled'}, {fail} failed.")
+                if action and not self.adb.dry_run:
+                    self.backup.add(action, pkg)
+            parts = []
+            if removed or method == "uninstall":
+                parts.append(f"{removed} removed")
+            if disabled or method == "disable":
+                parts.append(f"{disabled} disabled" + (" (system apps Android won't uninstall)"
+                                                        if method == "uninstall" and disabled else ""))
+            self.log(f"Done: {', '.join(parts)}, {fail} failed.")
             return self.adb.package_state()
 
         def done(state):
